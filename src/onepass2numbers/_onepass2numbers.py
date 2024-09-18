@@ -1,10 +1,13 @@
 import json
+import pathlib
 from argparse import ArgumentParser
 from datetime import datetime
-from sys import argv, exit
+from sys import exit
 from zipfile import ZipFile
 
+from colorama import Fore, Style
 from numbers_parser import Document
+
 from onepass2numbers import _get_version
 
 
@@ -27,7 +30,8 @@ def command_line_parser() -> ArgumentParser:
     parser.add_argument(
         "archive",
         nargs="?",
-        metavar="1PUX-ARCHIVE",
+        metavar="1PUX",
+        type=pathlib.Path,
         help="1Password 1PUX export",
     )
     return parser
@@ -50,12 +54,29 @@ def read_1pux_data(filename: str) -> object:
         return json.load(dataf, object_pairs_hook=fix_dup_keys)
 
 
-def red_message(s: str) -> None:
-    print(f"\033[31mWARNING! {s}\033[0m")
+def print_warning(s: str) -> None:
+    print(Fore.RED + Style.BRIGHT + f"WARNING! {s}" + Style.RESET_ALL)
+
+
+def print_error(s: str) -> None:
+    print(Fore.RED + Style.BRIGHT + f"ERROR! {s}" + Style.RESET_ALL)
+
+
+def field_filter(fields: dict[str, str]) -> list[str]:
+    filtered_fields = []
+    for field in fields:
+        value_key = next(iter(field["value"].keys()))
+        value = field["value"][value_key]
+        if not value or (isinstance(value, str) and value.startswith("otpauth://")):
+            continue
+        filtered_fields.append(f"{field["title"]}: {value}")
+
+    return filtered_fields
 
 
 parser = command_line_parser()
 args = parser.parse_args()
+
 if args.version:
     print(_get_version())
     exit(0)
@@ -63,21 +84,20 @@ elif not args.archive:
     parser.print_help()
     exit(1)
 
-data = read_1pux_data(args.archive)
+try:
+    data = read_1pux_data(args.archive)
+except FileNotFoundError as e:
+    print_error(str(e))
+    exit(1)
 
 doc = Document()
 sheet_num = 0
 
 if len(data["accounts"]) > 1:
-    red_message("only exporting one account")
+    print_warning("only exporting one account")
 
 account = data["accounts"][0]
 print(f"Processing account: {account['attrs']['name']}")
-
-# TODO:
-# Other login fields (add to notes)
-# ignore empty fields in notes
-# ignore OTP in fields for notes
 
 for vault in account["vaults"]:
     folder = vault["attrs"]["name"]
@@ -85,7 +105,7 @@ for vault in account["vaults"]:
 
     iterable = vault["items"]
     if len(iterable) == 0:
-        red_message("Empty iterable")
+        print_warning("Empty iterable")
         continue
 
     if sheet_num > 0:
@@ -103,7 +123,7 @@ for vault in account["vaults"]:
             "Created",
             "Updated",
             "Notes",
-        ]
+        ],
     ):
         sheet.tables[0].write(0, col, value)
 
@@ -112,28 +132,27 @@ for vault in account["vaults"]:
 
     row = 1
     for item in iterable:
-        favorite = item["favIndex"] if "favIndex" in item else 0
+        favorite = item.get("favIndex", 0)
 
         if "overview" not in item:
-            print("\033[93mWARNING! Overview is empty! Skipping item\033[0m")
+            print_warning("Overview is empty! Skipping item")
             continue
         overview = item["overview"]
-        name = overview["title"] if "title" in overview else ""
-        login_uri = overview["url"] if "url" in overview else ""
+        name = overview.get("title", "")
+        login_uri = overview.get("url", "")
 
         # Details Subsection
-        details = item["details"] if "details" in item else {}
-        notes = details["notesPlain"] if "notesPlain" in details else ""
+        details = item.get("details", {})
+        notes = details.get("notesPlain", "")
         updated = datetime.fromtimestamp(item["updatedAt"])
         created = datetime.fromtimestamp(item["createdAt"])
 
+        section_notes = []
         for section in item["details"]["sections"]:
-            if len(section["fields"]) > 1:
-                fields = [
-                    f"{x['title']}: {x['value'][list(x['value'].keys())[0]]}"
-                    for x in section["fields"]
-                ]
-                notes += "\n".join(fields)
+            if len(section["fields"]) > 0:
+                fields = field_filter(section["fields"])
+                section_notes += ["\n".join(fields)]
+        notes += "\n\n".join(section_notes)
 
         login_username, login_password = "", ""
         for field in details["loginFields"]:
@@ -151,7 +170,7 @@ for vault in account["vaults"]:
                 continue
             for field in fields:
                 value = field["value"]
-                login_totp = value["totp"] if "totp" in value else ""
+                login_totp = value.get("totp", "")
 
         for col, value in enumerate(
             [
@@ -163,7 +182,7 @@ for vault in account["vaults"]:
                 created,
                 updated,
                 notes,
-            ]
+            ],
         ):
             sheet.tables[0].write(row, col, value)
 
@@ -171,4 +190,4 @@ for vault in account["vaults"]:
 
     sheet_num += 1
 
-doc.save(argv[2])
+doc.save(args.output)
