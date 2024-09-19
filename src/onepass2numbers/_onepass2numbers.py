@@ -1,7 +1,7 @@
 import json
 import pathlib
 from argparse import ArgumentParser
-from datetime import datetime
+from datetime import datetime, timezone
 from sys import exit
 from zipfile import ZipFile
 
@@ -11,30 +11,12 @@ from numbers_parser import Document
 from onepass2numbers import _get_version
 
 
-def command_line_parser() -> ArgumentParser:
-    parser = ArgumentParser(
-        description="Convert a 1Password 1PUX file to a Numbers spreadsheet",
-    )
-    parser.add_argument("-V", "--version", action="store_true")
+def print_warning(s: str) -> None:
+    print(Fore.RED + Style.BRIGHT + f"WARNING! {s}" + Style.RESET_ALL)
 
-    parser.add_argument(
-        "--output",
-        "-o",
-        help="The output file name.",
-    )
-    parser.add_argument(
-        "--quiet",
-        "-q",
-        help="Supress informational messages.",
-    )
-    parser.add_argument(
-        "archive",
-        nargs="?",
-        metavar="1PUX",
-        type=pathlib.Path,
-        help="1Password 1PUX export",
-    )
-    return parser
+
+def print_error(s: str) -> None:
+    print(Fore.RED + Style.BRIGHT + f"ERROR! {s}" + Style.RESET_ALL)
 
 
 def fix_dup_keys(ordered_pairs: dict) -> dict:
@@ -49,19 +31,6 @@ def fix_dup_keys(ordered_pairs: dict) -> dict:
     return dictionary
 
 
-def read_1pux_data(filename: str) -> object:
-    with ZipFile(filename) as zipf, zipf.open("export.data") as dataf:
-        return json.load(dataf, object_pairs_hook=fix_dup_keys)
-
-
-def print_warning(s: str) -> None:
-    print(Fore.RED + Style.BRIGHT + f"WARNING! {s}" + Style.RESET_ALL)
-
-
-def print_error(s: str) -> None:
-    print(Fore.RED + Style.BRIGHT + f"ERROR! {s}" + Style.RESET_ALL)
-
-
 def field_filter(fields: dict[str, str]) -> list[str]:
     filtered_fields = []
     for field in fields:
@@ -69,125 +38,162 @@ def field_filter(fields: dict[str, str]) -> list[str]:
         value = field["value"][value_key]
         if not value or (isinstance(value, str) and value.startswith("otpauth://")):
             continue
-        filtered_fields.append(f"{field["title"]}: {value}")
+        filtered_fields.append(f"{field['title']}: {value}")
 
     return filtered_fields
 
 
-parser = command_line_parser()
-args = parser.parse_args()
+class PasswordConverter:
+    def __init__(self) -> None:
+        parser = ArgumentParser(
+            description="Convert a 1Password 1PUX file to a Numbers spreadsheet",
+        )
+        parser.add_argument("-V", "--version", action="store_true")
 
-if args.version:
-    print(_get_version())
-    exit(0)
-elif not args.archive:
-    parser.print_help()
-    exit(1)
+        parser.add_argument(
+            "--output",
+            "-o",
+            help="The output file name.",
+        )
+        parser.add_argument(
+            "--quiet",
+            "-q",
+            action="store_true",
+            help="Supress informational messages.",
+        )
+        parser.add_argument(
+            "archive",
+            nargs="?",
+            metavar="1PUX",
+            type=pathlib.Path,
+            help="1Password 1PUX export",
+        )
+        self.args = parser.parse_args()
+        if self.args.version:
+            print(_get_version())
+            exit(0)
+        elif not self.args.archive:
+            parser.print_help()
+            exit(1)
 
-try:
-    data = read_1pux_data(args.archive)
-except FileNotFoundError as e:
-    print_error(str(e))
-    exit(1)
+    def read_1pux_data(self) -> None:
+        with ZipFile(self.args.archive) as zipf, zipf.open("export.data") as dataf:
+            return json.load(dataf, object_pairs_hook=fix_dup_keys)
 
-doc = Document()
-sheet_num = 0
+    def convert(self) -> None:
+        try:
+            self.data = self.read_1pux_data()
+        except FileNotFoundError as e:
+            print_error(str(e))
+        else:
+            self.convert_data_to_numbers()
 
-if len(data["accounts"]) > 1:
-    print_warning("only exporting one account")
+    def add_sheet(self, name: str) -> None:
+        if self.current_sheet_num > 0:
+            self.doc.add_sheet()
+        self.current_sheet = self.doc.sheets[self.current_sheet_num]
+        self.current_sheet.name = name
 
-account = data["accounts"][0]
-print(f"Processing account: {account['attrs']['name']}")
+        for col, value in enumerate(
+            [
+                "Title",
+                "URL",
+                "Username",
+                "Password",
+                "OTP",
+                "Created",
+                "Updated",
+                "Notes",
+            ],
+        ):
+            self.current_sheet.tables[0].write(0, col, value)
+        self.current_sheet_num += 1
 
-for vault in account["vaults"]:
-    folder = vault["attrs"]["name"]
-    print(f"Processing folder: {folder}")
-
-    iterable = vault["items"]
-    if len(iterable) == 0:
-        print_warning("Empty iterable")
-        continue
-
-    if sheet_num > 0:
-        doc.add_sheet()
-    sheet = doc.sheets[sheet_num]
-    sheet.name = folder
-
-    for col, value in enumerate(
-        [
-            "Title",
-            "URL",
-            "Username",
-            "Password",
-            "OTP",
-            "Created",
-            "Updated",
-            "Notes",
-        ],
-    ):
-        sheet.tables[0].write(0, col, value)
-
-    if "item" in iterable[0]:
-        iterable = iterable[0].values()
-
-    row = 1
-    for item in iterable:
-        favorite = item.get("favIndex", 0)
-
+    def add_row(self, item: object, row: int) -> None:
         if "overview" not in item:
             print_warning("Overview is empty! Skipping item")
-            continue
-        overview = item["overview"]
-        name = overview.get("title", "")
-        login_uri = overview.get("url", "")
+            return
 
-        # Details Subsection
         details = item.get("details", {})
         notes = details.get("notesPlain", "")
-        updated = datetime.fromtimestamp(item["updatedAt"])
-        created = datetime.fromtimestamp(item["createdAt"])
 
         section_notes = []
+        login_totp = ""
         for section in item["details"]["sections"]:
             if len(section["fields"]) > 0:
                 fields = field_filter(section["fields"])
                 section_notes += ["\n".join(fields)]
+            for field in section["fields"]:
+                value = field["value"]
+                login_totp = value.get("totp", "")
+
         notes += "\n\n".join(section_notes)
 
         login_username, login_password = "", ""
         for field in details["loginFields"]:
             if "designation" not in field:
                 continue
-            if field["designation"] == "username":
+            designation = field["designation"]
+            if designation == "username":
                 login_username = field["value"]
-            if field["designation"] == "password":
+            elif designation == "password":
                 login_password = field["value"]
-
-        login_totp = ""
-        for section in details["sections"]:
-            fields = section["fields"]
-            if len(fields) == 0:
-                continue
-            for field in fields:
-                value = field["value"]
-                login_totp = value.get("totp", "")
+            else:
+                print_warning(f"Unknown designation '{designation}'")
 
         for col, value in enumerate(
             [
-                name,
-                login_uri,
+                item["overview"].get("title", ""),
+                item["overview"].get("url", ""),
                 login_username,
                 login_password,
                 login_totp,
-                created,
-                updated,
+                datetime.fromtimestamp(item["createdAt"], tz=timezone.utc),
+                datetime.fromtimestamp(item["updatedAt"], tz=timezone.utc),
                 notes,
             ],
         ):
-            sheet.tables[0].write(row, col, value)
+            self.current_sheet.tables[0].write(row, col, value)
 
-        row += 1
+    def convert_data_to_numbers(self) -> None:
+        self.doc = Document()
+        self.current_sheet_num = 0
 
-    sheet_num += 1
+        if len(self.data["accounts"]) > 1:
+            print_warning("Only exporting one account")
 
-doc.save(args.output)
+        account = self.data["accounts"][0]
+        if not self.args.quiet:
+            print(f"Processing account: {account['attrs']['name']}")
+
+        for vault in account["vaults"]:
+            folder = vault["attrs"]["name"]
+            if not self.args.quiet:
+                print(f"Processing folder: {folder}")
+
+            self.add_sheet(folder)
+
+            iterable = vault["items"]
+            if len(iterable) == 0:
+                print_warning(f"Empty iterable for '{folder}'")
+                return
+
+            if "item" in iterable[0]:
+                iterable = iterable[0].values()
+
+            row = 1
+            for item in iterable:
+                self.add_row(item, row)
+                row += 1
+
+        self.doc.save(self.args.output)
+
+
+def main() -> None:
+    converter = PasswordConverter()
+    converter.convert()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    # execute only if run as a script
+    main()
